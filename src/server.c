@@ -1,5 +1,5 @@
 /*
- * A tiny HTTP server.
+ * A tiny HTTPv1.0.3 server.
  *
  * Copyright (C) CZW. 2016
  * maintainer awenchen(czw8528@sina.com)
@@ -16,6 +16,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -23,6 +24,16 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include "list.h"
+
+/*
+ * The definition of macro "CONFIG_SCHE_RR" means that schedule policy is round-robin.
+ */
+#ifdef CONFIG_SCHE_RR
+    #define EPOLL_SCHE 0
+#else
+    #define EPOLL_SCHE EPOLLET
+#endif
+
 
 #define MAX_LISTEN_NUM    1000
 #define MAX_URI_LEN       256
@@ -51,10 +62,10 @@ enum METHOD
 
 enum PHASE
 {
-    HEAD_READ = 0,
-    HEAD_RESP,
-    BODY,
-    END,
+    HTTP_HEAD_READ = 0,
+    HTTP_HEAD_RESP,
+    HTTP_BODY,
+    HTTP_END,
 };
 
 typedef unsigned long long ull;
@@ -68,6 +79,7 @@ typedef struct epoll_base
     int evcap;      /* epoll base events capacity */
     
     int timeout;    /* dispatch timeout, millisecond */
+    int terminal;   /* the flag to terminal the loop */
     
     struct epoll_event *evptr; /* current active events */
 
@@ -77,7 +89,7 @@ typedef struct epoll_base
 
 typedef struct http_session
 {
-	int fd;
+    int fd;
     char method;
     char phase;
     char quit;
@@ -128,7 +140,6 @@ http_status_t http_code[] =
     { 501, "Not Implemented" },
 };
 
-static int try_send(event_buffer_t *ev);
 static event_buffer_t *epoll_event_buffer_new(epoll_base_t *base, int fd, int events, epoll_event_cb cb, void *arg);
 static void epoll_event_buffer_free(event_buffer_t *ev);
 
@@ -152,19 +163,22 @@ static int buffer_get_line(int sock, buffer_t *evbuf);
 static void copy_string(const char *start, const char *end, char *dst);
 static int nonblocking_recv(int fd, buffer_t *ev);
 static int nonblocking_send(int fd, buffer_t *ev);
-static int nonblocking_accept(event_buffer_t *ev);
+static int nonblocking_accept(int fd, struct sockaddr * addr, socklen_t *len);
 static void copy_string(const char *start, const char *end, char *dst);
 static int parse_key_and_value(const char *line, char *key, char *value);
 
 static void parse_request_info(const char *buf, char *method, char *uri);
 static int http_read_request(event_buffer_t *ev);
+static int http_try_send(event_buffer_t *ev);
 static void http_encapsulate_resp(buffer_t *evbuf, int code, const char *extra);
 static int http_read_header(event_buffer_t *ev);
 static int http_dispatch(event_buffer_t *ev);
 static int http_get_handler(event_buffer_t *ev);
 static int http_put_handler(event_buffer_t *ev);
+static int http_accept_request(event_buffer_t *ev);
 
 static int serv_start_up(int *port);
+static void install_signal_handler(void);
 
 #define buffer_clear(evbuf)  (evbuf->start = evbuf->end = evbuf->buf)
 #define buffer_rest(evbuf)   (evbuf->buf + evbuf->total - evbuf->end)
@@ -264,7 +278,7 @@ static void epoll_event_buffer_free(event_buffer_t *ev)
     http_session_t *sess = NULL;
     if( ev )
     {
-        printf("[%d] %s\n", ev->fd, __FUNCTION__);
+        //printf("[%d] %s\n", ev->fd, __FUNCTION__);
         if( ev->fd >= 0 )
             close(ev->fd);
         
@@ -363,7 +377,7 @@ static void epoll_base_dispatch(epoll_base_t *base)
         {
             base->evact = nfds;
 
-            printf("active events [%d], register events [%d]\n", base->evact, base->evreg);
+            //printf("active events [%d], register events [%d]\n", base->evact, base->evreg);
 
             epoll_events_handle(base->evptr, base->evact);
 
@@ -375,7 +389,17 @@ static void epoll_base_dispatch(epoll_base_t *base)
             perror("epoll_wait");
             break;
         }
+
+        /* loop terminal */
+        if( base->terminal || !base->evreg )
+            break;
     }
+}
+
+static void epoll_base_dispatch_once(epoll_base_t *base)
+{
+    base->terminal = 1;
+    epoll_base_dispatch(base);
 }
 
 static void epoll_base_free(epoll_base_t *base)
@@ -386,7 +410,7 @@ static void epoll_base_free(epoll_base_t *base)
 
     if( !base )
         return;
-    if( base->epfd > 0 )
+    if( base->epfd >= 0 )
         close(base->epfd);
 
     if( base->evptr )
@@ -481,9 +505,9 @@ static void epoll_events_handle(struct epoll_event *events, int evnum)
             continue;
         }
 
-        printf("[%d] %s active\n", ev->fd, events[loop].events & EPOLLIN ? "EPOLLIN" : "EPOLLOUT");
+        //printf("[%d] %s active\n", ev->fd, events[loop].events & EPOLLIN ? "EPOLLIN" : "EPOLLOUT");
 
-        epoll_events_print(base);
+        //epoll_events_print(base);
 
         if( ev->cb )
         {
@@ -632,7 +656,11 @@ static int buffer_get_line(int sock, buffer_t *evbuf)
         {
             if( c == '\r' )
             {
-                n = recv(sock, &c, 1, MSG_DONTWAIT | MSG_PEEK);
+                do
+                {
+                    n = recv(sock, &c, 1, MSG_DONTWAIT | MSG_PEEK);
+                } while( n < 0 && errno == EINTR );
+                
                 if( n > 0 )
                 {
                     if( c == '\n' )
@@ -645,10 +673,6 @@ static int buffer_get_line(int sock, buffer_t *evbuf)
                 else if( errno == EAGAIN )
                 {
                     return i+1;
-                }
-                else if( errno == EINTR )
-                {
-                    continue;
                 }
                 else
                 {
@@ -676,8 +700,16 @@ static int buffer_get_line(int sock, buffer_t *evbuf)
             return -1;
         }
     }
-
-    return -1;
+    /*
+     * If the program comes here, it means that the buffer rest is less than a line from server.
+     * However, it is difficult to predict the size of a line, so we just treat it as an 
+     * non-fatal error, and trancates it, then the caller would ignore it when failed to parse.
+     */
+    
+    printf("buffer is full, handle it first!\n");
+    
+    *evbuf->end = '\0';
+    return 0;
 }
 
 static void parse_request_info(const char *buf, char *method, char *uri)
@@ -793,23 +825,28 @@ static int nonblocking_send(int fd, buffer_t *evbuf)
     }
     else /* remain something */
     {
+        /*
+         * This is not a good method to move the data in buffer everytime,
+         * but I have not got a good idea to abstract a "buffer".
+         */
         buffer_shift(evbuf);
     }
 
     return totalsend;
 }
 
-static int nonblocking_accept(event_buffer_t *ev)
+
+/*
+ * try to accept a TCP request
+ * return value: >0, Ok, it's the new socket from client,
+ *                0, Not bad, just a illusion, wait for next come in,
+ *               -1, Oops, somethind wrong with the socket, shutdown it.
+ */
+static int nonblocking_accept(int fd, struct sockaddr *addr, socklen_t *len)
 {
-    int fd = ev->fd;
     int acceptfd = 0;
-    char client[MAX_CLI_LEN] = {0};
-    http_session_t *sess = NULL;
-    event_buffer_t *evnew = NULL;
-    struct sockaddr_in clientaddr;
-    socklen_t clientlen = sizeof(clientaddr);
     
-    acceptfd = accept(fd, (struct sockaddr *)&clientaddr, &clientlen);
+    acceptfd = accept(fd, addr, len);
     if( acceptfd == -1 )
     {
         /* non-fatal error */
@@ -829,6 +866,25 @@ static int nonblocking_accept(event_buffer_t *ev)
 
     set_socket_nonblocking(acceptfd);
 
+    return acceptfd;
+}
+
+static int http_accept_request(event_buffer_t *ev)
+{
+    int fd = ev->fd;
+    int acceptfd = 0;
+    char client[MAX_CLI_LEN] = {0};
+    http_session_t *sess = NULL;
+    event_buffer_t *evnew = NULL;
+    struct sockaddr_in clientaddr;
+    socklen_t clientlen = sizeof(clientaddr);
+    
+    acceptfd = nonblocking_accept(fd, (struct sockaddr *)&clientaddr, &clientlen);
+    if( acceptfd <= 0 )
+    {
+        return acceptfd;
+    }
+
     /* record the client info */
     snprintf(client, MAX_CLI_LEN, "[%s:%d]", inet_ntoa(clientaddr.sin_addr), ntohs(clientaddr.sin_port));
     printf("recv a connection request %s.\n", client);
@@ -841,7 +897,7 @@ static int nonblocking_accept(event_buffer_t *ev)
     }
     memset(sess, 0, sizeof(http_session_t));
 
-    evnew = epoll_event_buffer_new(ev->base, acceptfd, EPOLLIN|EPOLLET, http_dispatch, sess);
+    evnew = epoll_event_buffer_new(ev->base, acceptfd, EPOLLIN|EPOLL_SCHE, http_dispatch, sess);
     if( !evnew )
     {
         free(sess);
@@ -863,7 +919,7 @@ static int nonblocking_accept(event_buffer_t *ev)
     }
 
     strcpy(evnew->clientinfo, client);
-    printf("add event ok\n");
+    //printf("add event ok\n");
     
     return 0;
 }
@@ -934,9 +990,9 @@ static void http_encapsulate_resp(buffer_t *evbuf, int code, const char *extra)
     char errstr[1024] = {0};
 
     if( !extra )
-        sprintf(errstr, "HTTP/1.1 %d %s\r\n\r\n", code, get_http_code(code));
+        snprintf(errstr, 1024, "HTTP/1.1 %d %s\r\n\r\n", code, get_http_code(code));
     else
-        sprintf(errstr, "HTTP/1.1 %d %s\r\n%s\r\n", code, get_http_code(code), extra);
+        snprintf(errstr, 1024, "HTTP/1.1 %d %s\r\n%s\r\n", code, get_http_code(code), extra);
 
 
     strcpy(evbuf->end, errstr);
@@ -981,14 +1037,14 @@ static int http_read_header(event_buffer_t *ev)
                     break;
             }
 
-            ret = try_send(ev);
+            ret = http_try_send(ev);
             if( !ret )
             {
-                sess->phase = BODY;
+                sess->phase = HTTP_BODY;
                 
                 if( sess->method == GET )
                 {
-                    ev->event.events = EPOLLOUT|EPOLLET;
+                    ev->event.events = EPOLLOUT | EPOLL_SCHE;
                     return epoll_event_mod(ev->base, ev);
                 }
 
@@ -996,7 +1052,7 @@ static int http_read_header(event_buffer_t *ev)
             }
             else if( ret > 0 )
             {
-                sess->phase = HEAD_RESP;
+                sess->phase = HTTP_HEAD_RESP;
             }
 
             return ret;
@@ -1040,11 +1096,14 @@ static int http_get_handler(event_buffer_t *ev)
         }
     }
 
+#ifndef CONFIG_SCHE_RR
     while( 1 )
     {
+#endif
         rest = buffer_rest(evbuf);
         if( rest )
         {
+READ_AGAIN:
             rdlen = read(sess->fd, evbuf->end, rest);
             if( rdlen < 0 )
             {
@@ -1054,7 +1113,7 @@ static int http_get_handler(event_buffer_t *ev)
                 }
                 else if( errno == EINTR )
                 {
-                    continue;
+                    goto READ_AGAIN;
                 }
                 else
                 {
@@ -1080,7 +1139,11 @@ static int http_get_handler(event_buffer_t *ev)
                 return -1; /* it's over, shutdown */
             }
         }
+#ifndef CONFIG_SCHE_RR
     }
+#endif
+
+    return 0;
 }
 
 /*
@@ -1104,9 +1167,10 @@ static int http_put_handler(event_buffer_t *ev)
             return -500;
         }
     }
-
+#ifndef CONFIG_SCHE_RR
     while( 1 )
     {
+#endif
         recvlen = nonblocking_recv(ev->fd, evbuf);
         if( recvlen < 0 )
         {
@@ -1119,6 +1183,7 @@ static int http_put_handler(event_buffer_t *ev)
             return 0;
         }
         
+WRITE_AGAIN:
         wrlen = write(sess->fd, evbuf->start, occupy);
         if( wrlen < 0 )
         {
@@ -1128,7 +1193,7 @@ static int http_put_handler(event_buffer_t *ev)
             }
             else if( errno == EINTR )
             {
-                continue;
+                goto WRITE_AGAIN;
             }
             else
             {
@@ -1156,7 +1221,11 @@ static int http_put_handler(event_buffer_t *ev)
         {
             buffer_clear(evbuf);
         }
+#ifndef CONFIG_SCHE_RR
     }
+#endif
+
+    return 0;
 }
 
 static int http_dispatch(event_buffer_t *ev)
@@ -1167,29 +1236,29 @@ static int http_dispatch(event_buffer_t *ev)
 
     switch( sess->phase )
     {
-        case HEAD_READ:
+        case HTTP_HEAD_READ:
         {
             ret = http_read_header(ev);
             break;
         }
         
-        case HEAD_RESP:
+        case HTTP_HEAD_RESP:
         {
-            ret = try_send(ev);
+            ret = http_try_send(ev);
             if( !ret )
             {
-                sess->phase = BODY; /* transfer state */
+                sess->phase = HTTP_BODY; /* transfer state */
                 
                 if( sess->method == GET )
                 {
-                    ev->event.events = EPOLLIN|EPOLLET;
+                    ev->event.events = EPOLLIN|EPOLL_SCHE;
                     ret = epoll_event_mod(ev->base, ev);
                 }
             }
             break;
         }
         
-        case BODY:
+        case HTTP_BODY:
         {
             switch( sess->method )
             {
@@ -1206,7 +1275,7 @@ static int http_dispatch(event_buffer_t *ev)
             break;
         }
         
-        case END:
+        case HTTP_END:
         {
             if( buffer_empty(evbuf) )
             {
@@ -1214,7 +1283,7 @@ static int http_dispatch(event_buffer_t *ev)
             }
             else
             {
-                return try_send(ev);
+                return http_try_send(ev);
             }
             break;
         }
@@ -1232,12 +1301,12 @@ static int http_dispatch(event_buffer_t *ev)
             return -1;
         }
         
-        sess->phase = END;
+        sess->phase = HTTP_END;
         /*
          * if the return code less than -1, it means the code should be response to peer.
          */
         http_encapsulate_resp(evbuf, -ret, NULL);
-        return try_send(ev);
+        return http_try_send(ev);
     }
 
     return 0;
@@ -1248,7 +1317,7 @@ static int http_dispatch(event_buffer_t *ev)
  *              -1, Oops, there is something wrong or it's just over
  *               1, Not bad, remain some content, just wait for next event active
  */
-static int try_send(event_buffer_t *ev)
+static int http_try_send(event_buffer_t *ev)
 {
     int ret = 0;
     buffer_t *evbuf = &ev->evbuf;
@@ -1267,7 +1336,7 @@ static int try_send(event_buffer_t *ev)
     {
         if( !(ev->event.events & EPOLLOUT) )
         {
-            ev->event.events = EPOLLOUT|EPOLLET;
+            ev->event.events = EPOLLOUT | EPOLL_SCHE;
             ret = epoll_event_mod(ev->base, ev);
             if( ret < 0 )
                 return -1;
@@ -1276,7 +1345,7 @@ static int try_send(event_buffer_t *ev)
         return 1;
     }
 
-    if( sess->phase == END ) /* it's end, delete this event */
+    if( sess->phase == HTTP_END ) /* it's end, delete this event */
         return -1;
     else
         return 0;
@@ -1327,6 +1396,11 @@ static int serv_start_up(int *port)
     return fd;
 }
 
+static void install_signal_handler()
+{
+    signal(SIGPIPE, SIG_IGN);
+}
+
 /*
  * "./httpd port" or just "./httpd" to listen a random port.
  */
@@ -1347,6 +1421,8 @@ int main(int argc, char *argv[])
     {
         return -1;
     }
+    
+    install_signal_handler();
 
     if( port )
     {
@@ -1360,7 +1436,7 @@ int main(int argc, char *argv[])
         goto OVER;
     }
 
-    ev = epoll_event_buffer_new(base, fd, EPOLLIN, nonblocking_accept, NULL);
+    ev = epoll_event_buffer_new(base, fd, EPOLLIN, http_accept_request, NULL);
     if( !ev )
     {
         ret = 1;
